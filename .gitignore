@@ -39,3 +39,9 @@ data/sections/section8.npy
 data/sections/section9.npy
 data/tissue_density.npy
 checkpoints/random_experiment.pt
+.idea/vcs.xml
+.idea/modules.xml
+.idea/misc.xml
+.idea/MiceBrain.iml
+.idea/inspectionProfiles/Project_Default.xml
+.idea/inspectionProfiles/profiles_settings.xml

@@ -109,7 +109,7 @@ if __name__ == '__main__':
     model_path = f"checkpoints/{args['exp_name']}.pt"
 
     model = UNet1DModel(
-        sample_size=32,  # Adjusted to 32
+        sample_size=args['im_size'],  # Adjusted to im_size
         in_channels=157,
         out_channels=157,
         layers_per_block=1,
