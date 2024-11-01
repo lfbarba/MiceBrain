@@ -45,3 +45,5 @@ checkpoints/random_experiment.pt
 .idea/MiceBrain.iml
 .idea/inspectionProfiles/Project_Default.xml
 .idea/inspectionProfiles/profiles_settings.xml
+.ipynb_checkpoints/MiceDataset-checkpoint.ipynb
+checkpoints/.DS_Store

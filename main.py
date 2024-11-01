@@ -38,6 +38,7 @@ class diffusion_loss(BaseLoss):
     def compute_loss(self, instance, model):
         mse = torch.nn.MSELoss()
         x_0 = instance.flatten(0, 1).to(device)
+        x_0 = x_0[:, -11:] # We limit the number of reconstructed dimensions
         noise = torch.randn_like(x_0[:, 0]).to(device)
         expanded_noise = noise.repeat(x_0.shape[1], 1, 1).transpose(0, 1)
         bs = x_0.shape[0]
@@ -110,8 +111,8 @@ if __name__ == '__main__':
 
     model = UNet1DModel(
         sample_size=args['im_size'],  # Adjusted to im_size
-        in_channels=157,
-        out_channels=157,
+        in_channels=11,
+        out_channels=11,
         layers_per_block=1,
         block_out_channels=(32, 64),  # Reduced the number of output channels per block
         down_block_types=(
