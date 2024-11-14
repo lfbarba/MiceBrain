@@ -112,7 +112,7 @@ if __name__ == '__main__':
     trainSet, testSet = get_dataset(kwargs)
 
 
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('mps')
     # device = torch.device('cpu')
     print(device)
     model_path = f"checkpoints/{args['exp_name']}.pt"
