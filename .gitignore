@@ -47,3 +47,5 @@ checkpoints/random_experiment.pt
 .idea/inspectionProfiles/profiles_settings.xml
 .ipynb_checkpoints/MiceDataset-checkpoint.ipynb
 checkpoints/.DS_Store
+mice_recons.npy
+mice_recons2.npy
