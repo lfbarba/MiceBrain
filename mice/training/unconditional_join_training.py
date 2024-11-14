@@ -92,8 +92,8 @@ if __name__ == '__main__':
     args["scheduler"] = [int(x) for x in temp]
     args["seed"] = random.randint(0, 20000) if args["seed"] == -1 else args["seed"]
 
-    means = torch.tensor(np.load("means.npy"))
-    stds = torch.tensor(np.load("stds.npy"))
+    means = torch.tensor(np.load("../../means.npy"))
+    stds = torch.tensor(np.load("../../stds.npy"))
     kwargs = {
         "path": args['dataset_path'],
         'im_size':args['im_size'],
