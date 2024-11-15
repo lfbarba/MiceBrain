@@ -57,7 +57,7 @@ class diffusion_loss(BaseLoss):
         # Add noise to the clean images according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
         x_t = noise_scheduler.add_noise(x_0, noise, timesteps)
-        input = torch.stack([x_t, x_t], dim=1)
+        input = torch.stack([x_t, conditioning], dim=1)
 
 
         model.zero_grad()
@@ -121,7 +121,7 @@ if __name__ == '__main__':
         sample_size=args['im_size'],  # Adjusted to im_size
         in_channels=2,
         out_channels=1,
-        layers_per_block=2,
+        layers_per_block=1,
         block_out_channels=(32, 64),  # Reduced the number of output channels per block
         down_block_types=(
             "DownBlock1D",  # Keep the same
