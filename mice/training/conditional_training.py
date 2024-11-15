@@ -39,10 +39,10 @@ class diffusion_loss(BaseLoss):
         mse = torch.nn.MSELoss()
         x = instance.flatten(0, 1)
         target_channel = 145
-        source_channel = -1
+        condition_channel = -1
 
         x_0 = x[:, target_channel].to(device)
-        conditioning = x[:, source_channel].to(device)
+        conditioning = x[:, condition_channel].to(device)
         # We train with guidance-free
         conditioning[:len(conditioning)//2] *= 0
 
@@ -57,13 +57,13 @@ class diffusion_loss(BaseLoss):
         # Add noise to the clean images according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
         x_t = noise_scheduler.add_noise(x_0, noise, timesteps)
-        input = torch.stack([conditioning, x_t], dim=1)
+        input = torch.stack([x_t, x_t], dim=1)
 
 
         model.zero_grad()
         noise_pred = model(input, timesteps, return_dict=False)[0]
 
-        loss = mse(noise_pred, noise)
+        loss = mse(noise_pred.squeeze(), noise)
         return loss, {"loss": loss}
 
 
