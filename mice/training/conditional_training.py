@@ -121,14 +121,18 @@ if __name__ == '__main__':
         sample_size=args['im_size'],  # Adjusted to im_size
         in_channels=2,
         out_channels=1,
-        layers_per_block=1,
-        block_out_channels=(32, 64),  # Reduced the number of output channels per block
+        layers_per_block=2,
+        block_out_channels=(16, 32, 64, 64),  # Reduced the number of output channels per block
         down_block_types=(
-            "DownBlock1D",  # Keep the same
-            "AttnDownBlock1D",  # One less downsampling block
+            "DownBlock1D",
+            "DownBlock1D",  # a regular ResNet downsampling block
+            "AttnDownBlock1D",  # a ResNet downsampling block with spatial self-attention
+            "DownBlock1D",
         ),
         up_block_types=(
+            "UpBlock1D",
             "AttnUpBlock1D",  # Keep the same
+            "UpBlock1D",
             "UpBlock1D",  # Reduced the number of upsampling blocks accordingly
         ),
     ).to(device)
