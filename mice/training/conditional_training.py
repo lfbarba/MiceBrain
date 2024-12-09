@@ -63,7 +63,12 @@ class diffusion_loss(BaseLoss):
         model.zero_grad()
         noise_pred = model(input, timesteps, return_dict=False)[0]
 
-        loss = mse(noise_pred.squeeze(), noise)
+        fading_factor = noise_scheduler.add_noise(torch.ones(1), torch.zeros(1), timesteps).to(device)
+        noise_factor = noise_scheduler.add_noise(torch.zeros(1), torch.ones(1), timesteps).to(device)
+        x_0_pred = (x_t.unsqueeze(1) - noise_factor[:, None, None] * noise_pred) / fading_factor[:, None, None]
+
+        loss = mse(noise_pred.squeeze(1), noise)
+        loss += mse(x_0_pred.squeeze(1), x_0)
         return loss, {"loss": loss}
 
 
