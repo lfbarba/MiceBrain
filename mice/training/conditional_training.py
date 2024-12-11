@@ -38,11 +38,15 @@ class diffusion_loss(BaseLoss):
     def compute_loss(self, instance, model):
         mse = torch.nn.MSELoss()
         x = instance.flatten(0, 1)
-        target_channel = 145
-        condition_channel = -1
+        # target_channel = 145
+        # condition_channel = -1
+        #
+        # x_0 = x[:, target_channel].to(device)
+        # conditioning = x[:, condition_channel].to(device)
 
-        x_0 = x[:, target_channel].to(device)
-        conditioning = x[:, condition_channel].to(device)
+        x_0 = x[:, :-1].to(device)
+        conditioning = x[:, -1:].to(device)
+
         # We train with guidance-free
         conditioning[:len(conditioning)//2] *= 0
 
@@ -57,7 +61,7 @@ class diffusion_loss(BaseLoss):
         # Add noise to the clean images according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
         x_t = noise_scheduler.add_noise(x_0, noise, timesteps)
-        input = torch.stack([x_t, conditioning], dim=1)
+        input = torch.cat([x_t, conditioning], dim=1)
 
 
         model.zero_grad()
@@ -125,10 +129,10 @@ if __name__ == '__main__':
 
     model = UNet1DModel(
         sample_size=args['im_size'],  # Adjusted to im_size
-        in_channels=2,
-        out_channels=1,
+        in_channels=157,
+        out_channels=156,
         layers_per_block=2,
-        block_out_channels=(16, 32, 64, 64),  # Reduced the number of output channels per block
+        block_out_channels=(32, 64, 128, 256),  # Reduced the number of output channels per block
         down_block_types=(
             "DownBlock1D",
             "DownBlock1D",  # a regular ResNet downsampling block
