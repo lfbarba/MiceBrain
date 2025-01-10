@@ -46,9 +46,6 @@ class diffusion_loss(BaseLoss):
         # x_0 = x[:, :-1].to(device)
         # conditioning = x[:, -1:].to(device)
 
-        # We train with guidance-free
-        conditioning[:len(conditioning)//2] *= 0
-
         noise = torch.randn_like(x_0).to(device)
         bs = x_0.shape[0]
 
