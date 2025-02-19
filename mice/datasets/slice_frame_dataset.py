@@ -1,17 +1,31 @@
+# %% [markdown]
+"""
+Slice dataset
+
+We will create a dataset assuming we already have a dataframe with at least one density column
+
+The result are patches of shape (channels, patch_height, patch_width) and a mask of shape (channels,patch_height, patch_width)
+
+The mask will have 1 if data is missing, Data loader can choose to impute or mask loss
+"""
+
+import logging
 import math
+from argparse import ArgumentParser
 from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
+import torch.nn.functional as F
 from matplotlib.patches import Rectangle
+import sys
+sys.path.append("/Users/Daniel/git/libra-m/MiceBrain/mice")
+from mice.datasets.base_dataset import BaseImageDataset, PairedTransform
 from scipy.ndimage import rotate
-from argparse import ArgumentParser
-import pyarrow as pa
-import logging
-
-logging.basicConfig(level=logging.INFO)
+from tqdm import tqdm
 
 
 def compute_missing_pixels(df: pd.DataFrame) -> pd.DataFrame:
@@ -413,21 +427,22 @@ def create_multichannel_grid(df_section: pd.DataFrame, channels: list) -> np.nda
     multichannel_image = np.dstack(channel_grids)
     return multichannel_image
 
-def extract_patch(image: np.ndarray, start_row: int, start_col: int, patch_height: int, patch_width: int) -> np.ndarray:
+def extract_patch(image: torch.Tensor, start_row: int, start_col: int, patch_height: int, patch_width: int) -> torch.Tensor:
     """
     Extracts a patch from the image starting at (start_row, start_col).
     Works for both single-channel (2D) and multi-channel (3D) images.
     If the patch extends beyond image boundaries, missing values are filled with NaN.
     """
+    patch = torch.Tensor()
     if image.ndim == 2:
         img_rows, img_cols = image.shape
-        patch = np.full((patch_height, patch_width), np.nan, dtype=image.dtype)
+        patch = torch.full((patch_height, patch_width), float('nan'), dtype=image.dtype, device=image.device)
         end_row = min(start_row + patch_height, img_rows)
         end_col = min(start_col + patch_width, img_cols)
         patch[0:end_row - start_row, 0:end_col - start_col] = image[start_row:end_row, start_col:end_col]
     elif image.ndim == 3:
         img_rows, img_cols, channels = image.shape
-        patch = np.full((patch_height, patch_width, channels), np.nan, dtype=image.dtype)
+        patch = torch.full((patch_height, patch_width, channels), float('nan'), dtype=image.dtype, device=image.device)
         end_row = min(start_row + patch_height, img_rows)
         end_col = min(start_col + patch_width, img_cols)
         patch[0:end_row - start_row, 0:end_col - start_col, :] = image[start_row:end_row, start_col:end_col, :]
@@ -435,42 +450,117 @@ def extract_patch(image: np.ndarray, start_row: int, start_col: int, patch_heigh
         raise ValueError("Unsupported image dimensions.")
     return patch
 
-def sample_random_patches(out_path, df: pd.DataFrame, patch_width: int, patch_height: int, num_patches: int,
-                          channels, rotation_range: tuple = (-45, 45), save_metadata=False) -> dict:
+def rotate_image_torch(image: torch.Tensor, angle: float) -> torch.Tensor:
     """
-    For each unique section in 'z_bin', creates a multi-channel image by pivoting via the provided channels,
-    rotates the image by a random angle (from rotation_range),
-    and then extracts a patch (which includes all channels) from the rotated image.
+    Rotates an image (either 2D or 3D with channels last) by a given angle in degrees.
+    The output image is reshaped to fully contain the rotated image.
 
     Parameters:
-      df           : DataFrame with columns 'x_bin', 'y_bin', 'z_bin' and measurement columns.
+      image: torch.Tensor of shape (H, W) or (H, W, C)
+      angle: rotation angle in degrees
+
+    Returns:
+      Rotated image as a torch.Tensor with the same channel convention as input.
+      Areas outside the boundaries are assigned NaN.
+    """
+    # Convert angle to radians.
+    rad = math.radians(angle)
+    cos_a = math.cos(rad)
+    sin_a = math.sin(rad)
+
+    # Convert image tensor to shape [N, C, H, W]
+    # If input is 2D, add a channel dimension.
+    if image.ndim == 2:
+        image = image.unsqueeze(0).unsqueeze(0)  # shape [1, 1, H, W]
+    elif image.ndim == 3:
+        # Assume channels last; rearrange to channels-first.
+        image = image.permute(2, 0, 1).unsqueeze(0)  # shape [1, C, H, W]
+    else:
+        raise ValueError("Unsupported image dimensions. Must be 2D or 3D with channels last.")
+
+    _, C, H, W = image.shape
+
+    # Compute new dimensions to ensure the entire rotated image fits.
+    new_H = int(math.ceil(abs(H * cos_a) + abs(W * sin_a)))
+    new_W = int(math.ceil(abs(W * cos_a) + abs(H * sin_a)))
+
+    # Compute centers of original and new images.
+    cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
+    ncx, ncy = (new_W - 1) / 2.0, (new_H - 1) / 2.0
+
+    # Compute the offsets needed.
+    offset_x = ncx - (cos_a * cx - sin_a * cy)
+    offset_y = ncy - (sin_a * cx + cos_a * cy)
+
+    # Construct affine matrix. Devices are matched with the image.
+    theta = torch.tensor([[cos_a, -sin_a, offset_x],
+                          [sin_a,  cos_a, offset_y]], dtype=torch.float32, device=image.device)
+    theta = theta.unsqueeze(0)  # shape [1, 2, 3]
+
+    # Generate grid and sample.
+    grid = F.affine_grid(theta, size=[1, C, new_H, new_W], align_corners=False)
+    rotated = F.grid_sample(image, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+    # Identify areas that were sampled from out-of-bound coordinates.
+    ones = torch.ones_like(image)
+    mask = F.grid_sample(ones, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+    rotated[mask < 0.999] = float('nan')
+
+    # Convert back to original dimensions.
+    if rotated.shape[1] == 1:
+        rotated = rotated.squeeze(0).squeeze(0)  # shape [H, W]
+    else:
+        rotated = rotated.squeeze(0).permute(1, 2, 0)  # shape [H, W, C]
+
+    return rotated
+
+
+def sample_random_patches(out_path, df: pd.DataFrame, patch_width: int, patch_height: int, num_patches: int,
+                          channels, device: torch.device, rotation_range: tuple = (-45, 45), save_metadata=False) -> dict:
+    """
+    For each unique section in 'z_section', creates a multi-channel image by pivoting via the provided channels,
+    rotates the image by a random angle (from rotation_range) using PyTorch for acceleration,
+    and then extracts a patch (which includes all channels) from the rotated image.
+
+    All tensors are allocated on the given device.
+
+    Parameters:
+      df           : DataFrame with columns 'x_bin', 'y_bin', 'z_section' and measurement columns.
       patch_width  : Width (number of columns) of the desired patch.
       patch_height : Height (number of rows) of the desired patch.
       num_patches  : Number of patches to extract per section.
       channels     : List of column names to use for creating the multi-channel image.
+      device       : torch.device to which all tensors are sent.
       rotation_range: Tuple (min_angle, max_angle) for choosing a random rotation angle.
+      save_metadata: If True, returns metadata for each patch.
 
     Returns:
-      A dictionary where keys are unique z_bin identifiers and values are lists of dictionaries.
+      A dictionary where keys are unique z_section identifiers and values are lists of dictionaries.
       Each dictionary contains:
-         'patch': Extracted patch (shape (patch_height, patch_width) for grayscale or (patch_height, patch_width, channels) for multi-channel).
+         'patch': Extracted patch as a torch.Tensor.
          'start_row': Starting row in the rotated image.
          'start_col': Starting column in the rotated image.
-         'rotated_image': The full rotated image.
+         'rotated_image': The full rotated image as a torch.Tensor.
          'angle': Rotation angle applied.
     """
     patches_by_section = {}
 
-    for z in df['z_section'].unique():
+    for i,z in enumerate(df['z_section'].unique()):
         df_section = df[df['z_section'] == z]
         # Create multi-channel image using pivot (all channels together).
-        image = create_multichannel_grid(df_section, channels)
+        logging.info(f"Creating multi-channel grid for section {i} of {len(df['z_section'].unique())}")
+        image_np = create_multichannel_grid(df_section, channels)
+        # Convert to torch tensor with float32 type on the given device.
+        logging.debug(f"Converting to torch tensor on device {device}")
+        image_torch = torch.tensor(image_np, dtype=torch.float32, device=device)
 
         patch_info_list = []
-        for j in range(num_patches):
-            angle = np.random.uniform(*rotation_range)
-            # Rotate the entire image. Using reshape=True ensures the rotated image contains all data.
-            rotated_image = rotate(image, angle=angle, reshape=True, order=1, mode='constant', cval=np.nan)
+        for j in tqdm(range(num_patches)):
+            logging.debug(f"Extracting patch {j} for section {z}")
+            angle = float(np.random.uniform(*rotation_range))
+            # Rotate the image using the PyTorch accelerated function.
+            logging.debug(f"Rotating image by {angle:.2f} degrees")
+            rotated_image = rotate_image_torch(image_torch, angle)
             img_rows, img_cols = rotated_image.shape[:2]
 
             max_start_row = img_rows - patch_height + 1 if img_rows >= patch_height else 1
@@ -478,18 +568,28 @@ def sample_random_patches(out_path, df: pd.DataFrame, patch_width: int, patch_he
             start_row = np.random.randint(0, max_start_row)
             start_col = np.random.randint(0, max_start_col)
 
+            logging.debug(f"Extracting patch at row {start_row}, col {start_col}")
             patch_ = extract_patch(rotated_image, start_row, start_col, patch_height, patch_width)
 
-            patch_name = f"section_{z}-patch_{j}-r_{start_row}-c{start_col}-a_{angle}"
-            mask_name = f"section_{z}-mask_{j}-r_{start_row}-c{start_col}-a_{angle}"
-            mask = patch_ == np.nan
-            patch_ = torch.tensor(patch_)
-            mask = torch.tensor(mask)
-            torch.save(patch_, out_path / f"{patch_name}.pt")
-            torch.save(mask, out_path / f"{mask_name}.pt")
+            if patch_.isnan().all():
+                pass
 
+
+            patch_ = patch_.permute(2, 0, 1)
+            assert patch_.shape == (len(channels), patch_height, patch_width)
+            patch_name = f"section_{z}-patch_{j}-r_{start_row}-c_{start_col}-a_{angle:.2f}"
+            mask_name = f"section_{z}-mask_{j}-r_{start_row}-c_{start_col}-a_{angle:.2f}"
+
+            # Create a mask indicating where the patch is NaN.
+            mask = torch.isnan(patch_)
+            # Save the patch and mask.
+            logging.debug(f"Saving patch and mask to {out_path}")
+            torch.save(patch_, (out_path / f"{patch_name}.pt"))
+            logging.debug(f"Saving mask to {out_path}")
+            torch.save(mask, (out_path / f"{mask_name}.pt"))
 
             if save_metadata:
+                logging.debug(f"Saving metadata for patch {j}")
                 patch_info = {
                     'patch': patch_,
                     'start_row': start_row,
@@ -502,28 +602,125 @@ def sample_random_patches(out_path, df: pd.DataFrame, patch_width: int, patch_he
             patches_by_section[z] = patch_info_list
     return patches_by_section
 
+
+
+# %% [markdown]
+"""
+Class that loads a dataset of patch files and their corresponding masks.
+"""
+class PatchFileDataset(BaseImageDataset):
+
+    def __init__(self, path, im_size, lr_forward_function=lambda x:x,
+                 rescale=None, clip_range=None, normalize_range=False, rotation_angle=None, num_defects=None,
+                 contrast=None, train_transform=False, crop=None, gray_background=False,
+                 to_synthetic=False, means=None, stds=None, channels=None):
+        super().__init__(path, lr_forward_function=lr_forward_function,
+                 rescale=rescale, clip_range=clip_range, normalize_range=normalize_range, rotation_angle=rotation_angle, num_defects=num_defects,
+                 contrast=contrast, train_transform=train_transform, crop=crop,
+                         to_synthetic=to_synthetic)
+        if type(path) == str:
+            self.path = Path(path)
+        else:
+            self.path = path
+        self.im_size = im_size
+        if channels is not None:
+            self.channels = channels
+        # search for all files with "patch" in  path
+        self.images = [p.name for p in Path(path).glob("*patch*.pt")]
+        # masks and patch have same name except for the keyword "mask" or "patch"
+        # build a dictionary to match them
+        # self.masks = { p: Path(str(p).replace("patch", "mask")) for p in self.images}
+        # zip the images and masks
+        self.available_channels=torch.load(self.path / self.images[0]).shape[0]
+        if channels is not None:
+            self.channels = channels
+            self.available_channels = len(channels)
+        else:
+            self.channels = list(range(self.available_channels))
+        self.means=None
+        self.stds=None
+        if means is not None:
+            self.means = means[channels]
+        if stds is not None:
+            self.stds = stds[channels]
+        print("loading imagges")
+        #self.stacked_img = [torch.load(self.path / p) for p in self.images]
+        #self.masked_img = [torch.load(self.path / p) for p in self.masks]
+
+        self.lr_forward_function = lr_forward_function
+
+    def __getitem__(self, idx):
+        stacked_img = torch.load(self.path / self.images[idx])
+        #mask = torch.load(self.path / self.masks[self.images[idx]])
+        #stacked_img = self.stacked_img[idx]
+        stacked_img = stacked_img[self.channels]
+        #mask = self.masked_img[idx]
+        #mask = mask[self.channels]
+        #mask = mask[self.channels]
+        if self.means is not None:
+            return (stacked_img - self.means[None, :, None]) / self.stds[None, :, None]
+        else:
+            # I created the dataset with the assumption that the images are channel, height, width
+            # but the data loader seems to assume  width, channel, height
+            # so I permute the tensor to match the data loader
+            stacked_img=stacked_img.permute(1, 0, 2)
+            # for experiment I will replace nan in stacked_img with 0
+            stacked_img[stacked_img.isnan()] = 0
+            return stacked_img
+
+    def __len__(self):
+        return len(self.images)
+
+
+
+
 parser = ArgumentParser()
-parser.add_argument("--data_file", type=str, required=False, help="Path to the parquet file containing the data.")
-parser.add_argument("--pixel_size", type=float, default=0.025, help="Size of each grid cell in millimeters.")
-parser.add_argument("--value_cols", type=str, nargs='+', required=False, help="List of columns to average in each grid cell.")
-parser.add_argument("--patch_width", type=int, default=128, help="Width of the extracted patch.")
-parser.add_argument("--patch_height", type=int, default=1, help="Height of the extracted patch.")
-parser.add_argument("--num_patches", type=int, default=2, help="Number of patches to extract per section.")
+parser.add_argument("--data-file", type=str, required=False, help="Path to the parquet file containing the data.")
+parser.add_argument("--pixel-size", type=float, default=0.025, help="Size of each grid cell in millimeters.")
+parser.add_argument("--value-cols", type=str, nargs='+', required=False, help="List of columns to average in each grid cell.")
+parser.add_argument("--patch-width", type=int, default=128, help="Width of the extracted patch.")
+parser.add_argument("--patch-height", type=int, default=1, help="Height of the extracted patch.")
+parser.add_argument("--num-patches", type=int, default=2, help="Number of patches to extract per section.")
 parser.add_argument("--channels", type=str, nargs='+', required=False, help="List of channels to use for multi-channel image.")
-parser.add_argument("--rotation_range", type=float, nargs=2, default=(-45, 45), help="Range of rotation angles.")
-parser.add_argument("--save_metadata", action="store_true", help="Save metadata for each patch.")
-parser.add_argument("--aggregated_file", type=str, required=False, help="Path to the parquet file containing the aggregated data.")
+parser.add_argument("--rotation-range", type=float, nargs=2, default=(-45, 45), help="Range of rotation angles.")
+parser.add_argument("--save-metadata", action="store_true", help="Save metadata for each patch.")
+parser.add_argument("--aggregated-file", type=str, required=False, help="Path to the parquet file containing the aggregated data.")
 parser.add_argument("--environment", type=str, required=False, help="Environment to run the script in.")
+parser.add_argument("--device", type=str, default="cpu", help="Device to use for tensor operations.")
+parser.add_argument("--test", action="store_true", help="Run the script with test arguments.")
+parser.add_argument("--logging-level", type=str, default="INFO", help="Logging level for the script.")
+
+test_args = [
+    "--data-file", "combined_cell_filtered_w500genes_density_minimal_train.parquet",
+    "--aggregated-file", "combined_cell_filtered_w500genes_density_minimal_train_aggregated.parquet",
+    "--pixel-size", "0.025",
+    "--value-cols", "density",
+    "--patch-width", "128",
+    "--patch-height", "1",
+    "--num-patches", "1000",
+    "--channels", "density",
+    "--rotation-range", "-45", "45",
+    "--device", "cpu",
+    "--logging-level", "INFO"
+]
 
 if __name__ == "__main__":
-    logging.info("Starting script")
+    print("Begin")
     args = parser.parse_args()
-    args.environment = "local"
+    if args.test:
+        args = parser.parse_args(test_args)
+        args.environment = "local"
+
     if args.environment == "local":
         merfish_path = "/Users/Daniel/mlibra-data/merfish/"
     if args.environment == "runai":
         merfish_path = "/s3/mlibra/mlibra-data/merfish/"
+    if args.logging_level == "DEBUG":
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
 
+    logging.info("Starting script")
     merfish_path = Path(merfish_path)
     merfish_out_path = merfish_path / "patches"
     merfish_out_path.mkdir(exist_ok=True)
@@ -533,13 +730,17 @@ if __name__ == "__main__":
     dataset_name = f"merfish_{patch_width}x{patch_height}"
     dataset_path = merfish_out_path / dataset_name
     dataset_path.mkdir(exist_ok=True, parents=True)
+    device = torch.device(args.device)
 
-    merfish_data = merfish_path / "combined_cell_filtered_w500genes_density_minimal_train.parquet"
-    agg_data = merfish_path / "combined_cell_filtered_w500genes_density_minimal_train_aggregated.parquet"
+    merfish_data = merfish_path / args.data_file
+    agg_data = merfish_path / args.aggregated_file
     logging.info(f"Loading data from {merfish_data}")
     if agg_data.exists():
         logging.info(f"Loading aggregated data from {agg_data}")
         agg_df = pd.read_parquet(agg_data)
+        logging.debug(f"Aggregated data loaded with columns: {agg_df.columns}")
+        logging.debug(f"Aggregated data shape: {agg_df.shape}")
+       
     else:
         logging.info(f"Aggregated data not found. Creating from {merfish_data}")
         schema = pq.read_table(merfish_data).schema
@@ -555,6 +756,7 @@ if __name__ == "__main__":
     logging.info(f"Creating patches from {dataset_path}")
     sample_random_patches(out_path = dataset_path,
                           df=agg_df,
+                          device=device,
                           patch_width=patch_width,
                           patch_height=patch_height,
                           num_patches=num_patches,channels= gen_cols + ['density'])

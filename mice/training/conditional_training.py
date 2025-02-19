@@ -14,13 +14,16 @@ from diffusers import UNet1DModel
 from diffusers import DDPMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
 import math
-from mice.datasets.slice_dataset import SliceDataset
+import sys
+#from datasets.slice_dataset import SliceDataset
+from mice.datasets.slice_frame_dataset import PatchFileDataset
 import numpy as np
 
 from torch.utils.data import Dataset
 
 def get_dataset(kwargs):
-    dataset = SliceDataset(**kwargs)
+    # dataset = SliceDataset(**kwargs)
+    dataset = PatchFileDataset(**kwargs)
     torch.manual_seed(0)
     perm = torch.randperm(len(dataset))
     trainSet = torch.utils.data.Subset(dataset, perm[:round(0.95 * len(dataset))])
@@ -37,7 +40,9 @@ class diffusion_loss(BaseLoss):
 
     def compute_loss(self, instance, model):
         mse = torch.nn.MSELoss()
+        # NOTE Either here or in the dataset I have to squeeze
         x = instance.flatten(0, 1)
+        # TODO: maybe move to the data loader
         target_channel = 145
         condition_channel = -1
         x_0 = x[:, target_channel].to(device)
@@ -113,9 +118,12 @@ if __name__ == '__main__':
         "path": args['dataset_path'],
         'im_size':args['im_size'],
         "train_transform": True,
-        'stds': stds,
-        'means': means
+        # 'stds': stds,
+        # 'means': means
+        'stds': None,
+        'means': None
     }
+    # NOTE the only argument of interest at the moment is path. The rest are hardcoded on patch creation.
     trainSet, testSet = get_dataset(kwargs)
 
 
@@ -123,7 +131,7 @@ if __name__ == '__main__':
     # device = torch.device('cpu')
     print(device)
     model_path = f"checkpoints/{args['exp_name']}.pt"
-
+    print(args['im_size'])
     model = UNet1DModel(
         sample_size=args['im_size'],  # Adjusted to im_size
         in_channels=2,
@@ -161,7 +169,7 @@ if __name__ == '__main__':
         checkpoint_path=model_path,
         experiment_name=args['exp_name'],
         with_wandb=args['wandb'],
-        num_workers=torch.get_num_threads() if torch.cuda.is_available() else 0,
+        num_workers= torch.get_num_threads() if torch.cuda.is_available() else 0,
         seed=args["seed"],
         args=args,
         save_always=True
