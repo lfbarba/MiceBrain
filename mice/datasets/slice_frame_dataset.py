@@ -544,13 +544,41 @@ def sample_random_patches(out_path, df: pd.DataFrame, patch_width: int, patch_he
          'angle': Rotation angle applied.
     """
     patches_by_section = {}
+    # for merfish data sections are given by z_section (on mm), and pixel
+    # coordinates are given by x_section and y_section also on mm.
+    # for MALDI data sections are given by Section, pixel coordinates are given
+    # by columns x and y in pixel coordinates.
+    if 'z_section' not in df.columns:
+        section_col = 'Section'
+        x_column = 'x'
+        y_column = 'y'
+    else:
+        section_col = 'z_section'
+        x_column = 'x_section'
+        y_column = 'y_section'
 
-    for i,z in enumerate(df['z_section'].unique()):
-        df_section = df[df['z_section'] == z]
+    for i,z in enumerate(df[section_col].unique()):
+        df_section = df[df[section_col] == z]
         # Create multi-channel image using pivot (all channels together).
-        logging.info(f"Creating multi-channel grid for section {i} of {len(df['z_section'].unique())}")
-        image_np = create_multichannel_grid(df_section, channels)
-        # Convert to torch tensor with float32 type on the given device.
+        logging.info(f"Creating multi-channel grid for section {i} of {len(df[section_col].unique())}")
+        if x_column == 'x_section':
+            image_np = create_multichannel_grid(df_section, channels)
+        else:
+            # For maldi there is no need to create grid, as pixels are at the
+            # same resolution as the image
+            # we create a tensor of shape (channels, height, width)
+            # height given by the maximum y value, width given by the maximum x value
+            # we will fill the tensor with NaN
+            image_np =  np.full((len(channels), df_section[x_column].max() + 1, df_section[y_column].max() + 1), np.nan)
+            current_shape = image_np.shape
+            # fill the 3d images with the values from the data frame, first
+            # dimention are the channels, second and third are the pixel coordinates
+            x_coordinates = df_section[x_column].values
+            y_coordinates = df_section[y_column].values
+            values = df_section[channels].values.T
+            image_np[:, x_coordinates, y_coordinates] = values
+            # permute so that the first dimension becomes the last dimention
+            image_np = np.transpose(image_np, (1, 2, 0))
         logging.debug(f"Converting to torch tensor on device {device}")
         image_torch = torch.tensor(image_np, dtype=torch.float32, device=device)
 
@@ -578,15 +606,15 @@ def sample_random_patches(out_path, df: pd.DataFrame, patch_width: int, patch_he
             patch_ = patch_.permute(2, 0, 1)
             assert patch_.shape == (len(channels), patch_height, patch_width)
             patch_name = f"section_{z}-patch_{j}-r_{start_row}-c_{start_col}-a_{angle:.2f}"
-            mask_name = f"section_{z}-mask_{j}-r_{start_row}-c_{start_col}-a_{angle:.2f}"
+            # mask_name = f"section_{z}-mask_{j}-r_{start_row}-c_{start_col}-a_{angle:.2f}"
 
             # Create a mask indicating where the patch is NaN.
             mask = torch.isnan(patch_)
             # Save the patch and mask.
             logging.debug(f"Saving patch and mask to {out_path}")
             torch.save(patch_, (out_path / f"{patch_name}.pt"))
-            logging.debug(f"Saving mask to {out_path}")
-            torch.save(mask, (out_path / f"{mask_name}.pt"))
+            # logging.debug(f"Saving mask to {out_path}")
+            # torch.save(mask, (out_path / f"{mask_name}.pt"))
 
             if save_metadata:
                 logging.debug(f"Saving metadata for patch {j}")
@@ -631,7 +659,7 @@ class PatchFileDataset(BaseImageDataset):
         # build a dictionary to match them
         # self.masks = { p: Path(str(p).replace("patch", "mask")) for p in self.images}
         # zip the images and masks
-        self.available_channels=torch.load(self.path / self.images[0]).shape[0]
+        self.available_channels=torch.load(self.path / self.images[0],map_location='cpu').shape[0]
         if channels is not None:
             self.channels = channels
             self.available_channels = len(channels)
@@ -650,7 +678,7 @@ class PatchFileDataset(BaseImageDataset):
         self.lr_forward_function = lr_forward_function
 
     def __getitem__(self, idx):
-        stacked_img = torch.load(self.path / self.images[idx])
+        stacked_img = torch.load(self.path / self.images[idx],map_location='cpu')
         #mask = torch.load(self.path / self.masks[self.images[idx]])
         #stacked_img = self.stacked_img[idx]
         stacked_img = stacked_img[self.channels]
@@ -673,26 +701,13 @@ class PatchFileDataset(BaseImageDataset):
 
 
 
-
-parser = ArgumentParser()
-parser.add_argument("--data-file", type=str, required=False, help="Path to the parquet file containing the data.")
-parser.add_argument("--pixel-size", type=float, default=0.025, help="Size of each grid cell in millimeters.")
-parser.add_argument("--value-cols", type=str, nargs='+', required=False, help="List of columns to average in each grid cell.")
-parser.add_argument("--patch-width", type=int, default=128, help="Width of the extracted patch.")
-parser.add_argument("--patch-height", type=int, default=1, help="Height of the extracted patch.")
-parser.add_argument("--num-patches", type=int, default=2, help="Number of patches to extract per section.")
-parser.add_argument("--channels", type=str, nargs='+', required=False, help="List of channels to use for multi-channel image.")
-parser.add_argument("--rotation-range", type=float, nargs=2, default=(-45, 45), help="Range of rotation angles.")
-parser.add_argument("--save-metadata", action="store_true", help="Save metadata for each patch.")
-parser.add_argument("--aggregated-file", type=str, required=False, help="Path to the parquet file containing the aggregated data.")
-parser.add_argument("--environment", type=str, required=False, help="Environment to run the script in.")
-parser.add_argument("--device", type=str, default="cpu", help="Device to use for tensor operations.")
-parser.add_argument("--test", action="store_true", help="Run the script with test arguments.")
-parser.add_argument("--logging-level", type=str, default="INFO", help="Logging level for the script.")
-
 test_args = [
-    "--data-file", "combined_cell_filtered_w500genes_density_minimal_train.parquet",
-    "--aggregated-file", "combined_cell_filtered_w500genes_density_minimal_train_aggregated.parquet",
+    # "--modality", "merfish",
+    # "--data-file", "combined_cell_filtered_w500genes_density_minimal_train.parquet",
+    # "--aggregated-file", "combined_cell_filtered_w500genes_density_minimal_train_aggregated.parquet",
+    "--modality", "maldi",
+    "--data-file", "lba_all_pixels_fully_abamapped11282023_exp_density_minimal.parquet",
+    "--aggregated-file", "",
     "--pixel-size", "0.025",
     "--value-cols", "density",
     "--patch-width", "128",
@@ -700,63 +715,108 @@ test_args = [
     "--num-patches", "1000",
     "--channels", "density",
     "--rotation-range", "-45", "45",
-    "--device", "cpu",
-    "--logging-level", "INFO"
+    "--device", "cuda",
+    "--logging-level", "INFO",
+    "--environment", "runai"
 ]
 
 if __name__ == "__main__":
-    print("Begin")
-    args = parser.parse_args()
-    if args.test:
-        args = parser.parse_args(test_args)
-        args.environment = "local"
 
-    if args.environment == "local":
+    parser = ArgumentParser()
+    parser.add_argument("--data-file", type=str, required=False, help="Path to the parquet file containing the data.")
+    parser.add_argument("--pixel-size", type=float, default=0.025, help="Size of each grid cell in millimeters.")
+    parser.add_argument("--value-cols", type=str, nargs='+', required=False, help="List of columns to average in each grid cell.")
+    parser.add_argument("--patch-width", type=int, default=128, help="Width of the extracted patch.")
+    parser.add_argument("--patch-height", type=int, default=1, help="Height of the extracted patch.")
+    parser.add_argument("--num-patches", type=int, default=2, help="Number of patches to extract per section.")
+    parser.add_argument("--channels", type=str, nargs='+', required=False, help="List of channels to use for multi-channel image.")
+    parser.add_argument("--rotation-range", type=float, nargs=2, default=(-45, 45), help="Range of rotation angles.")
+    parser.add_argument("--save-metadata", action="store_true", help="Save metadata for each patch.")
+    parser.add_argument("--aggregated-file", type=str, required=False, help="Path to the parquet file containing the aggregated data.")
+    parser.add_argument("--environment", type=str, required=False, help="Environment to run the script in.")
+    parser.add_argument("--device", type=str, default="cpu", help="Device to use for tensor operations.")
+    parser.add_argument("--test", action="store_true", help="Run the script with test arguments.")
+    parser.add_argument("--logging-level", type=str, default="INFO", help="Logging level for the script.")
+    parser.add_argument("--modality", type=str, default="merfish", help="Modality of the data (merfish or maldi).")
+
+
+    print("Begin")
+    #args = parser.parse_args()
+    args_ = parser.parse_args(test_args)
+
+    if args_.environment == "local":
         merfish_path = "/Users/Daniel/mlibra-data/merfish/"
-    if args.environment == "runai":
+        maldi_path = "/Users/Daniel/mlibra-data/maldi/"
+    if args_.environment == "runai":
         merfish_path = "/s3/mlibra/mlibra-data/merfish/"
-    if args.logging_level == "DEBUG":
+        maldi_path = "/s3/mlibra/mlibra-data/maldi/"
+    if args_.logging_level == "DEBUG":
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.INFO)
-
     logging.info("Starting script")
     merfish_path = Path(merfish_path)
     merfish_out_path = merfish_path / "patches"
     merfish_out_path.mkdir(exist_ok=True)
-    patch_width = args.patch_width
-    patch_height = args.patch_height
-    num_patches = args.num_patches
-    dataset_name = f"merfish_{patch_width}x{patch_height}"
-    dataset_path = merfish_out_path / dataset_name
-    dataset_path.mkdir(exist_ok=True, parents=True)
-    device = torch.device(args.device)
+    maldi_path = Path(maldi_path)
+    mald_out_path = maldi_path / "patches"
+    mald_out_path.mkdir(exist_ok=True)
 
-    merfish_data = merfish_path / args.data_file
-    agg_data = merfish_path / args.aggregated_file
-    logging.info(f"Loading data from {merfish_data}")
-    if agg_data.exists():
-        logging.info(f"Loading aggregated data from {agg_data}")
-        agg_df = pd.read_parquet(agg_data)
-        logging.debug(f"Aggregated data loaded with columns: {agg_df.columns}")
-        logging.debug(f"Aggregated data shape: {agg_df.shape}")
-       
+    patch_width = args_.patch_width
+    patch_height = args_.patch_height
+    num_patches = args_.num_patches
+    device = torch.device(args_.device)
+
+    if args_.modality == "merfish":
+        # If merfish we have to aggregate the data to 25 micrometer pixels
+        merfish_data = merfish_path / args_.data_file
+
+        agg_data = merfish_path / args_.aggregated_file
+        dataset_name = f"merfish_{patch_width}x{patch_height}"
+        dataset_path = merfish_out_path / dataset_name
+
+        if agg_data.exists():
+            logging.info(f"Loading aggregated data from {agg_data}")
+            agg_df = pd.read_parquet(agg_data)
+            logging.debug(f"Aggregated data loaded with columns: {agg_df.columns}")
+            logging.debug(f"Aggregated data shape: {agg_df.shape}")
+
+        else:
+            logging.info(f"Aggregated data not found. Creating from {merfish_data}")
+            schema = pq.read_table(merfish_data).schema
+            gene_cols = [col for col in schema.names if col.startswith("ENS")]
+            location_cols = ['x_section', 'y_section', 'z_section']
+            df = pd.read_parquet(merfish_data, columns= location_cols + gene_cols + ['density'])
+            agg_df = create_grid_average(df, args_.pixel_size, gene_cols+['density'])
+            logging.info(f"Saving aggregated data")
+            agg_df.to_parquet(agg_data)
+            del df
+        logging.info(f"Loading data from {merfish_data}")
+        schema = pq.read_table(agg_data).schema
+        gen_cols = [col for col in schema.names if col.startswith("ENS")]
+        logging.info(f"Creating patches from {dataset_path}")
+        channels = gen_cols + ['density']
     else:
-        logging.info(f"Aggregated data not found. Creating from {merfish_data}")
-        schema = pq.read_table(merfish_data).schema
-        gene_cols = [col for col in schema.names if col.startswith("ENS")]
-        location_cols = ['x_section', 'y_section', 'z_section']
-        df = pd.read_parquet(merfish_data, columns= location_cols + gene_cols + ['density'])
-        agg_df = create_grid_average(df, args.pixel_size, gene_cols+['density'])
-        logging.info(f"Saving aggregated data")
-        agg_df.to_parquet(agg_data)
-        del df
-    schema = pq.read_table(agg_data).schema
-    gen_cols = [col for col in schema.names if col.startswith("ENS")]
-    logging.info(f"Creating patches from {dataset_path}")
+        # If maldi we have to create patches from the data
+        maldi_data = maldi_path / args_.data_file
+        dataset_name = f"maldi_{patch_width}x{patch_height}"
+        dataset_path = mald_out_path / dataset_name
+
+
+        agg_df=pd.read_parquet(maldi_data)
+        deselected_columns = ['x_voxel', 'y_voxel', 'z_voxel', 'Section', 'x_ccf', 'y_ccf',
+                              'z_ccf','acronym','x','y','density']
+        agg_df['x'] = [ int(p.split("pixel")[1].split("_")[0]) for p in  agg_df.index.values]
+        agg_df['y'] = [ int(p.split("pixel")[1].split("_")[1]) for p in  agg_df.index.values]
+        channels = [col for col in agg_df.columns if col not in
+                    deselected_columns] + ['density']
+        # We have to be careful of only selecting pixel columns and lipids.
+
+    dataset_path.mkdir(exist_ok=True, parents=True)
     sample_random_patches(out_path = dataset_path,
                           df=agg_df,
                           device=device,
                           patch_width=patch_width,
                           patch_height=patch_height,
-                          num_patches=num_patches,channels= gen_cols + ['density'])
+                          num_patches=num_patches,
+                          channels= channels)
