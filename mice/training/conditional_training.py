@@ -33,22 +33,27 @@ def get_dataset(kwargs):
 
 class diffusion_loss(BaseLoss):
 
-    def __init__(self):
+    def __init__(self, mask_loss=False):
         stats_names = ["loss"]
         super(diffusion_loss, self).__init__(stats_names)
-
+        self.mask_loss=mask_loss
 
 
     def compute_loss(self, instance, model):
         mse = torch.nn.MSELoss()
-        # NOTE Either here or in the dataset I have to squeeze
-        x = instance.flatten(0, 1)
+        # this considers pixels of height 1 and width 128
+        x = instance.flatten(0, 1) # flatten the height pixel from the data.
+        # For experiments, nan become zero.
+        mask = x.isnan()
+        x[mask] = 0
+
         # TODO: maybe move to the data loader
         target_channel = 145
         condition_channel = -1
         x_0 = x[:, target_channel].to(device)
+        # let's use the mask
+        mask = mask[:, target_channel].to(device)
         conditioning = x[:, condition_channel].to(device)
-
         # x_0 = x[:, :-1].to(device)
         # conditioning = x[:, -1:].to(device)
 
@@ -74,9 +79,9 @@ class diffusion_loss(BaseLoss):
         # noise_factor = noise_scheduler.add_noise(torch.zeros(1), torch.ones(1), timesteps).to(device)
         # x_0_pred = (x_t.unsqueeze(1) - noise_factor[:, None, None] * noise_pred) / fading_factor[:, None, None]
         # x_0_pred = x_0_pred.clip(-3, 3)
-
         # loss = mse(noise_pred.squeeze(1), noise)
-        loss = mse(x_0_pred.squeeze(1), x_0)
+        x_0_pred = x_0_pred.squeeze(1)
+        loss = mse(x_0_pred[~mask], x_0[~mask])
         return loss, {"loss": loss}
 
 
@@ -135,6 +140,7 @@ if __name__ == '__main__':
     print(device)
     model_path = Path(args['model_path'])
     model_path = model_path / "checkpoints"/ f"{args['exp_name']}.pt"
+    model_path.parent
     model_path.parent.mkdir(parents=True, exist_ok=True)
     print(args['im_size'])
     model = UNet1DModel(
