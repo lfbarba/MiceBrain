@@ -758,9 +758,7 @@ class PatchFileDataset(BaseImageDataset):
         # for experiment I will replace nan in stacked_img with 0
         if self.means is not None:
             stacked_img = (stacked_img - self.means.T[None, :]) / self.stds.T[None, :]
-        # For experiments, nan become zero.
-        stacked_img[stacked_img.isnan()] = 0
-        # make sure is a float tensor
+       # make sure is a float tensor
         stacked_img = stacked_img.float()
 
         return stacked_img
