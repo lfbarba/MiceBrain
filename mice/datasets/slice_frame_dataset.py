@@ -25,6 +25,9 @@ import sys
 sys.path.append("/Users/Daniel/git/libra-m/MiceBrain/mice")
 from mice.datasets.base_dataset import BaseImageDataset, PairedTransform
 from scipy.ndimage import rotate
+from torchvision.transforms.functional import resize, InterpolationMode
+
+from torchvision import transforms
 from tqdm import tqdm
 
 
@@ -514,6 +517,55 @@ def rotate_image_torch(image: torch.Tensor, angle: float) -> torch.Tensor:
 
     return rotated
 
+def extract_line(image, length=128):
+    """
+    Extracts a line of specified length from the image.
+    Image is expected to be of shape (H, W, C) where H and W
+    are the height and width and C is the channel dimension.
+
+    Returns a dictionary with:
+      - 'line_values': Tensor with shape (length, C) of the interpolated values.
+      - 'start_point': Tuple (x, y) denoting the pixel coordinates where the line starts.
+      - 'angle_deg': The random angle used in degrees.
+      - 'grid': The sampling grid used in grid_sample.
+    """
+    H, W, C = image.shape
+
+    # Select a random starting pixel within the image bounds
+    y0 = torch.randint(0, H, (1,)).item()
+    x0 = torch.randint(0, W, (1,)).item()
+
+    # Select a random angle between -180 and 180 degrees
+    angle_deg = (torch.rand(1).item() * 360) - 180
+    angle_rad = math.radians(angle_deg)
+
+    # Generate 128 sample points along a line in 1-pixel increments
+    t = torch.linspace(0, length - 1, steps=length,device=image.device)
+    delta_x = math.cos(angle_rad) * t
+    delta_y = math.sin(angle_rad) * t
+    xs = x0 + delta_x
+    ys = y0 + delta_y
+
+    # Convert pixel coordinates to normalized coordinates in the range [-1, 1]
+    # Normalization: norm_coord = 2 * (coord / (size - 1)) - 1
+    grid_x = (xs / (W - 1)) * 2 - 1
+    grid_y = (ys / (H - 1)) * 2 - 1
+
+    # Build the sampling grid.
+    # grid_sample expects a grid of shape (N, H_out, W_out, 2)
+    grid = torch.stack((grid_x, grid_y), dim=1)  # shape (length, 2)
+    grid = grid.view(1, length, 1, 2)
+
+    # Rearrange image to shape (1, C, H, W) for grid_sample
+    image_t = image.permute(2, 0, 1).unsqueeze(0)
+
+    # Sample the image along the grid with bilinear interpolation.
+    # align_corners=True makes the normalization consistent.
+    sampled = F.grid_sample(image_t, grid, mode='bilinear', align_corners=True)
+    # The output shape is (1, C, length, 1); squeeze the unnecessary dimensions.
+    sampled = sampled.squeeze(0).squeeze(-1).permute(1, 0)  # shape becomes (length, C)
+    #torch.save(sampled, "/Users/Daniel/git/libra-m/line_sampled.pt")
+    return sampled
 
 def sample_random_patches(out_path, df: pd.DataFrame, patch_width: int, patch_height: int, num_patches: int,
                           channels, device: torch.device, rotation_range: tuple = (-45, 45), save_metadata=False) -> dict:
@@ -579,16 +631,27 @@ def sample_random_patches(out_path, df: pd.DataFrame, patch_width: int, patch_he
             image_np[:, x_coordinates, y_coordinates] = values
             # permute so that the first dimension becomes the last dimention
             image_np = np.transpose(image_np, (1, 2, 0))
+        breakpoint()
         logging.debug(f"Converting to torch tensor on device {device}")
         image_torch = torch.tensor(image_np, dtype=torch.float32, device=device)
-
+        np.save("image_np.npy", image_np)
         patch_info_list = []
         for j in tqdm(range(num_patches)):
             logging.debug(f"Extracting patch {j} for section {z}")
             angle = float(np.random.uniform(*rotation_range))
             # Rotate the image using the PyTorch accelerated function.
+            ## This rotates the image and takes the patch
+            #rotated_image= transforms.RandomAffine((-180,180),(0,0),(1,1.3), interpolation=InterpolationMode.BILINEAR)(image_torch.permute(2,0,1))
+            #torch.save(rotated_image, "rotated_image.pt")
+            #rotated_image=rotated_image.permute(1,2,0)
+            ###################
+            ###################
+            # Instead experimental, we take the line and sample along it
+            # add a 0 dimention to the image
             logging.debug(f"Rotating image by {angle:.2f} degrees")
-            rotated_image = rotate_image_torch(image_torch, angle)
+            rotated_image = extract_line(image_torch , length=patch_width )
+            rotated_image = rotated_image.unsqueeze(0)
+            assert rotated_image.shape[2] == len(channels)
             img_rows, img_cols = rotated_image.shape[:2]
 
             max_start_row = img_rows - patch_height + 1 if img_rows >= patch_height else 1
@@ -641,7 +704,7 @@ class PatchFileDataset(BaseImageDataset):
     def __init__(self, path, im_size, lr_forward_function=lambda x:x,
                  rescale=None, clip_range=None, normalize_range=False, rotation_angle=None, num_defects=None,
                  contrast=None, train_transform=False, crop=None, gray_background=False,
-                 to_synthetic=False, means=None, stds=None, channels=None):
+                 to_synthetic=False, means=None, stds=None, channels=None, left_out_slice:str=""):
         super().__init__(path, lr_forward_function=lr_forward_function,
                  rescale=rescale, clip_range=clip_range, normalize_range=normalize_range, rotation_angle=rotation_angle, num_defects=num_defects,
                  contrast=contrast, train_transform=train_transform, crop=crop,
@@ -655,6 +718,9 @@ class PatchFileDataset(BaseImageDataset):
             self.channels = channels
         # search for all files with "patch" in  path
         self.images = [p.name for p in Path(path).glob("*patch*.pt")]
+        if left_out_slice is not "":
+            # we discard a left out slice if any
+            self.images = [p for p in self.images if left_out_slice not in p]
         # masks and patch have same name except for the keyword "mask" or "patch"
         # build a dictionary to match them
         # self.masks = { p: Path(str(p).replace("patch", "mask")) for p in self.images}
@@ -685,16 +751,19 @@ class PatchFileDataset(BaseImageDataset):
         #mask = self.masked_img[idx]
         #mask = mask[self.channels]
         #mask = mask[self.channels]
+        # I created the dataset with the assumption that the images are channel, height, width
+        # but the data loader seems to assume  width, channel, height
+        # so I permute the tensor to match the data loader
+        stacked_img=stacked_img.permute(1, 0, 2)
+        # for experiment I will replace nan in stacked_img with 0
         if self.means is not None:
-            return (stacked_img - self.means[None, :, None]) / self.stds[None, :, None]
-        else:
-            # I created the dataset with the assumption that the images are channel, height, width
-            # but the data loader seems to assume  width, channel, height
-            # so I permute the tensor to match the data loader
-            stacked_img=stacked_img.permute(1, 0, 2)
-            # for experiment I will replace nan in stacked_img with 0
-            stacked_img[stacked_img.isnan()] = 0
-            return stacked_img
+            stacked_img = (stacked_img - self.means.T[None, :]) / self.stds.T[None, :]
+        # For experiments, nan become zero.
+        stacked_img[stacked_img.isnan()] = 0
+        # make sure is a float tensor
+        stacked_img = stacked_img.float()
+
+        return stacked_img
 
     def __len__(self):
         return len(self.images)
@@ -704,7 +773,7 @@ class PatchFileDataset(BaseImageDataset):
 test_args = [
     # "--modality", "merfish",
     # "--data-file", "combined_cell_filtered_w500genes_density_minimal_train.parquet",
-    # "--aggregated-file", "combined_cell_filtered_w500genes_density_minimal_train_aggregated.parquet",
+    # "--aggregated-file", "combined_cell_filtered_w500genes_density_minimal_train_aggregated.parquet"
     "--modality", "maldi",
     "--data-file", "lba_all_pixels_fully_abamapped11282023_exp_density_minimal.parquet",
     "--aggregated-file", "",
@@ -714,7 +783,7 @@ test_args = [
     "--patch-height", "1",
     "--num-patches", "1000",
     "--channels", "density",
-    "--rotation-range", "-45", "45",
+    "--rotation-rang sbe", "-180", "180",
     "--device", "cuda",
     "--logging-level", "INFO",
     "--environment", "runai"
@@ -730,7 +799,7 @@ if __name__ == "__main__":
     parser.add_argument("--patch-height", type=int, default=1, help="Height of the extracted patch.")
     parser.add_argument("--num-patches", type=int, default=2, help="Number of patches to extract per section.")
     parser.add_argument("--channels", type=str, nargs='+', required=False, help="List of channels to use for multi-channel image.")
-    parser.add_argument("--rotation-range", type=float, nargs=2, default=(-45, 45), help="Range of rotation angles.")
+    parser.add_argument("--rotation-range", type=float, nargs=2, default=(-180, 180), help="Range of rotation angles.")
     parser.add_argument("--save-metadata", action="store_true", help="Save metadata for each patch.")
     parser.add_argument("--aggregated-file", type=str, required=False, help="Path to the parquet file containing the aggregated data.")
     parser.add_argument("--environment", type=str, required=False, help="Environment to run the script in.")
@@ -742,24 +811,32 @@ if __name__ == "__main__":
 
     print("Begin")
     #args = parser.parse_args()
-    args_ = parser.parse_args(test_args)
+    args_ = parser.parse_args()
+    merfish_data_path = "combined_cell_filtered_w500genes_density_minimal_train.parquet"
+    maldi_data_path="lba_all_pixels_fully_abamapped11282023_exp_density_minimal.parquet"
+    merfish_agg_data_path = "combined_cell_filtered_w500genes_density_minimal_train_aggregated.parquet"
 
     if args_.environment == "local":
         merfish_path = "/Users/Daniel/mlibra-data/merfish/"
         maldi_path = "/Users/Daniel/mlibra-data/maldi/"
+        merfish_out_path = "/Users/Daniel/mlibra-data/merfish/"
+        maldi_out_path = "/Users/Daniel/mlibra-data/maldi/"
+
     if args_.environment == "runai":
         merfish_path = "/s3/mlibra/mlibra-data/merfish/"
         maldi_path = "/s3/mlibra/mlibra-data/maldi/"
+        maldi_out_path ="/mydata/mlibra/shared/brain2/maldi/patches/"
+        merfish_out_path="/mydata/mlibra/shared/brain2/merfish/patches"
     if args_.logging_level == "DEBUG":
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.INFO)
     logging.info("Starting script")
     merfish_path = Path(merfish_path)
-    merfish_out_path = merfish_path / "patches"
+    merfish_out_path = Path(merfish_out_path)
     merfish_out_path.mkdir(exist_ok=True)
     maldi_path = Path(maldi_path)
-    mald_out_path = maldi_path / "patches"
+    mald_out_path = Path(maldi_out_path)
     mald_out_path.mkdir(exist_ok=True)
 
     patch_width = args_.patch_width
@@ -769,12 +846,13 @@ if __name__ == "__main__":
 
     if args_.modality == "merfish":
         # If merfish we have to aggregate the data to 25 micrometer pixels
-        merfish_data = merfish_path / args_.data_file
 
-        agg_data = merfish_path / args_.aggregated_file
+        merfish_data = merfish_path / merfish_data_path
+
+        agg_data = merfish_path / merfish_agg_data_path
         dataset_name = f"merfish_{patch_width}x{patch_height}"
         dataset_path = merfish_out_path / dataset_name
-
+       
         if agg_data.exists():
             logging.info(f"Loading aggregated data from {agg_data}")
             agg_df = pd.read_parquet(agg_data)
@@ -783,14 +861,14 @@ if __name__ == "__main__":
 
         else:
             logging.info(f"Aggregated data not found. Creating from {merfish_data}")
-            schema = pq.read_table(merfish_data).schema
+            schema = pq.read_schema(merfish_data)
             gene_cols = [col for col in schema.names if col.startswith("ENS")]
             location_cols = ['x_section', 'y_section', 'z_section']
+            breakpoint()
             df = pd.read_parquet(merfish_data, columns= location_cols + gene_cols + ['density'])
             agg_df = create_grid_average(df, args_.pixel_size, gene_cols+['density'])
             logging.info(f"Saving aggregated data")
             agg_df.to_parquet(agg_data)
-            del df
         logging.info(f"Loading data from {merfish_data}")
         schema = pq.read_table(agg_data).schema
         gen_cols = [col for col in schema.names if col.startswith("ENS")]
@@ -798,7 +876,7 @@ if __name__ == "__main__":
         channels = gen_cols + ['density']
     else:
         # If maldi we have to create patches from the data
-        maldi_data = maldi_path / args_.data_file
+        maldi_data = maldi_path / maldi_data_path
         dataset_name = f"maldi_{patch_width}x{patch_height}"
         dataset_path = mald_out_path / dataset_name
 
@@ -811,8 +889,11 @@ if __name__ == "__main__":
         channels = [col for col in agg_df.columns if col not in
                     deselected_columns] + ['density']
         # We have to be careful of only selecting pixel columns and lipids.
-
+    # we save the channels in a file to make sure we retrieve them in the right order
     dataset_path.mkdir(exist_ok=True, parents=True)
+    channels = np.array(channels)
+    np.save(Path(dataset_path) / "channels.npy", channels)
+
     sample_random_patches(out_path = dataset_path,
                           df=agg_df,
                           device=device,

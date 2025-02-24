@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 from diffusers import UNet1DModel
 from diffusers import DDPMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
+from pathlib import Path
 import math
 import sys
 #from datasets.slice_dataset import SliceDataset
@@ -101,27 +102,29 @@ if __name__ == '__main__':
     parser.add_argument('--wandb', action='store_true', help="Use wandb")
     parser.add_argument("--load_checkpoint", default='', type=str, help="name of models in folder checkpoints to load")
     parser.add_argument("--seed", default=-1, type=int, help="Random seed")
-
+    parser.add_argument("--model_path", default='', type=str, help="name of models in folder checkpoints to load")
     parser.add_argument("--dataset_path", type=str, help="Path to the dataset file or folder")
     parser.add_argument("--im_size", type=int, default=512, help="In the case of tiff, the size of the crops to split the tiff files")
     parser.add_argument("--rescale", type=int, default=512, help="The side length of the images in the dataset")
+    parser.add_argument("--means-file", type=str, default="means.npy", help="The file containing the means of the dataset")
+    parser.add_argument("--stds-file", type=str, default="stds.npy", help="The file containing the stds of the dataset")
+    parser.add_argument("--num_workers", type=int, default=-1, help="Number of workers for the dataloader")
 
 
     args = vars(parser.parse_args())
     temp = args["scheduler"].replace(" ", "").replace("[", "").replace("]", "").split(",")
     args["scheduler"] = [int(x) for x in temp]
     args["seed"] = random.randint(0, 20000) if args["seed"] == -1 else args["seed"]
-
-    means = torch.tensor(np.load("means.npy"))
-    stds = torch.tensor(np.load("stds.npy"))
+    means_file = args["means_file"]
+    stds_file = args["stds_file"]
+    means = torch.tensor(np.load(means_file))
+    stds = torch.tensor(np.load(stds_file))
     kwargs = {
         "path": args['dataset_path'],
         'im_size':args['im_size'],
         "train_transform": True,
-        # 'stds': stds,
-        # 'means': means
-        'stds': None,
-        'means': None
+        'stds': stds,
+        'means': means
     }
     # NOTE the only argument of interest at the moment is path. The rest are hardcoded on patch creation.
     trainSet, testSet = get_dataset(kwargs)
@@ -130,7 +133,9 @@ if __name__ == '__main__':
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('mps')
     # device = torch.device('cpu')
     print(device)
-    model_path = f"checkpoints/{args['exp_name']}.pt"
+    model_path = Path(args['model_path'])
+    model_path = model_path / "checkpoints"/ f"{args['exp_name']}.pt"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
     print(args['im_size'])
     model = UNet1DModel(
         sample_size=args['im_size'],  # Adjusted to im_size
@@ -160,6 +165,13 @@ if __name__ == '__main__':
 
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
 
+    if torch.cuda.is_available():
+        num_workers = torch.get_num_threads()
+        if args["num_workers"] != -1:
+            num_workers = min(num_workers,args["num_workers"])
+    else:
+        num_workers = 0
+    print(f"num_workers: {num_workers}")
     exp = PyTorchExperiment(
         train_dataset=trainSet,
         test_dataset=testSet,
@@ -169,7 +181,7 @@ if __name__ == '__main__':
         checkpoint_path=model_path,
         experiment_name=args['exp_name'],
         with_wandb=args['wandb'],
-        num_workers= torch.get_num_threads() if torch.cuda.is_available() else 0,
+        num_workers=num_workers,
         seed=args["seed"],
         args=args,
         save_always=True
